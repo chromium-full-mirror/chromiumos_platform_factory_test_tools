@@ -11,6 +11,7 @@ A detailed description of gft_common.
 """
 
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -130,25 +131,21 @@ def GetTemporaryFileName(prefix='gft', suffix=''):
   return filename
 
 
-def SystemOutput(command,
-                 ignore_status=False,
-                 show_progress=False,
-                 progress_messsage=None,
-                 return_exit_code=False):
-  """ Retrieves the output of a shell command.
-  Returns the output string.
+def ShellExecution(command,
+                   ignore_status=False,
+                   show_progress=False,
+                   progress_message=None):
+  """ Executes a shell command, and return the results.
 
   Args:
     ignore_status: False to raise exectopion when execution result is not zero
     show_progress: Shows progress by messages and dots
-    progress_messsage: Messages printed before starting.
-    return_exit_code: True if we want the exit code value, or the console output
+    progress_message: Messages printed before starting.
 
   Returns:
-    If return_exit_code is True, return value is an integer of exit code.
-    Otherwise, return value is a string of stdout by command.
+    (exit_code, stdout_messages, stderr_messages)
   """
-  DebugMsg("SystemOutput: %s" % command, log=False)
+  DebugMsg("ShellExecution: %s" % command, log=False)
   temp_stderr = tempfile.TemporaryFile()
   temp_stdout = tempfile.TemporaryFile()
   proc = subprocess.Popen(command,
@@ -157,38 +154,53 @@ def SystemOutput(command,
                           shell=True)
   if show_progress:
     sys.stdout.flush()
-    if progress_messsage:
-      sys.stderr.write(progress_messsage)
+    if progress_message:
+      sys.stderr.write(progress_message)
     while proc.poll() is None:
       sys.stderr.write('.')
       time.sleep(1)
-    if progress_messsage:
+    if progress_message:
       sys.stderr.write('\n')
   else:
     proc.communicate()
 
+  # collect output
   temp_stdout.seek(0)
   out = temp_stdout.read()
   temp_stdout.close()
 
+  temp_stderr.seek(0)
+  err = temp_stderr.read()
+  temp_stderr.close()
+
   exit_code = proc.wait()
   if exit_code:
     # prepare to log the error message.
-    temp_stderr.seek(0)
-    err = temp_stderr.read()
-    temp_stderr.close()
     message = ('Failed executing command: %s\n'
                'Output and Error Messages: %s\n%s' % (command, out, err))
     if ignore_status:
       DebugMsg(message)
     else:
       ErrorDie(message)
+  return (exit_code, out, err)
 
-  if return_exit_code:
-    return exit_code
-  if out[-1:] == '\n':
-    out = out[:-1]
-  return out
+
+def SystemOutput(command,
+                 ignore_status=False,
+                 show_progress=False,
+                 progress_message=None):
+  """ Returns the stdout results from a shell command execution. """
+  return ShellExecution(command, ignore_status, show_progress,
+                        progress_message)[1].rstrip('\n')
+
+
+def System(command,
+           ignore_status=False,
+           show_progress=False,
+           progress_message=None):
+  """ Returns the exit code from a shell command execution. """
+  return ShellExecution(command, ignore_status, show_progress,
+                        progress_message)[0]
 
 
 def ReadOneLine(filename):
@@ -213,6 +225,29 @@ def WriteFile(filename, data):
   """ Writes one file and exit. """
   with open(filename, "w") as opened_file:
     opened_file.write(data)
+
+
+def GetSystemArch():
+  """Gets current system architecture, in portage-style return value.
+  Returns:
+    Currently supported list: 'arm', 'x86', 'amd64'
+  """
+  (exit_code, arch, _) = ShellExecution('crossystem arch', ignore_status=True)
+  arch = arch.strip()
+  authorized_archs = ('amd64', 'arm', 'x86')
+  if exit_code != 0:
+    # probing with legacy command.
+    machine = SystemOutput('uname -m')
+    if re.match('^i.86', machine):
+      arch = 'x86'
+    elif re.match('^x86_64', machine):
+      arch = 'amd64'
+    elif re.match('^armv', machine):
+      arch = 'arm'
+    else:
+      arch = 'unknown'
+  assert arch in authorized_archs, "Unknown architecture: %s" % arch
+  return arch
 
 
 def ThreadSafe(f):

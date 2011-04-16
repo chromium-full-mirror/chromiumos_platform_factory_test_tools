@@ -5,6 +5,7 @@
 # found in the LICENSE file.
 
 import glob
+import imp
 import os
 import pprint
 import re
@@ -19,15 +20,11 @@ import vblock
 from gft_common import DebugMsg, VerboseMsg, WarningMsg, ErrorMsg, ErrorDie
 
 
-def Memorize(f):
-  return gft_common.ThreadSafe(gft_common.Memorize(f))
-
-
 class HardwareComponents(object):
   """ Hardware Components Scanner """
 
   # Function names in this class are used for reflection, so please don't change
-  # the function names even if they are not comliant to coding style guide.
+  # the function names even if they are not compliant to coding style guide.
 
   version = 6
 
@@ -63,7 +60,7 @@ class HardwareComponents(object):
     'vendor_id_touchpad',
     'version_3g_firmware',
     'version_rw_firmware',
-    # Deprcated fields:
+    # Deprecated fields:
     # 'part_id_gps',
     # - GPS is currently not supported by OS and no way to probe it.
     #   We should enable it only when OS supports it.
@@ -92,6 +89,14 @@ class HardwareComponents(object):
   # TODO(hungte) unify the 'not available' style messages
   _not_present = ''
   _no_match = 'No match'
+  _failure_list = [_not_present, _no_match, '']
+
+  # Type id for connection management (compatible to flimflam)
+  _type_3g = 'cellular'
+  _type_ethernet = 'ethernet'
+  _type_wireless = 'wifi'
+
+  _flimflam_dir = '/usr/local/lib/flimflam/test'
 
   def __init__(self, verbose=False):
     self._initialized = False
@@ -102,7 +107,8 @@ class HardwareComponents(object):
     self._flashrom = flashrom_util.flashrom_util(
         verbose_msg=VerboseMsg,
         exception_type=gft_common.GFTError,
-        system_output=gft_common.SystemOutput)
+        system_output=gft_common.SystemOutput,
+        system=gft_common.System)
     self._temp_files = []
 
     # variables for matching
@@ -121,6 +127,19 @@ class HardwareComponents(object):
 
   # --------------------------------------------------------------------
   # System Probing Utilities
+
+  def Memorize(f):
+    """ Decorator for thread-safe memorization """
+    return gft_common.ThreadSafe(gft_common.Memorize(f))
+
+  def EcProperty(f):
+    """ Decorator for properties that requires programmable EC """
+    def wrapper(*args, **kargs):
+      self = args[0]
+      if not self.has_ec():
+        return self._not_present
+      return f(*args, **kargs)
+    return wrapper
 
   @Memorize
   def load_module(self, name):
@@ -149,7 +168,7 @@ class HardwareComponents(object):
         device_list += ['%s:%s' % (entry[:4], entry[4:])
                         for entry in pci_list]
     else:
-      DebugMsg('Failed to read %s. Execute lspci.' % pci_device_list)
+      DebugMsg('Failed to read %s. Execute lspci.' % pci_device_file)
       pci_list = [entry.split()[2:4]
                   for entry in
                   gft_common.SystemOutput('lspci -n -mm').splitlines()]
@@ -166,21 +185,75 @@ class HardwareComponents(object):
     return device_list
 
   @Memorize
+  def import_flimflam_module(self):
+    """ Tries to load flimflam module from current system """
+    if not os.path.exists(self._flimflam_dir):
+      DebugMsg('no flimflam installed in %s' % self._flimflam_dir)
+      return None
+    try:
+      return imp.load_module('flimflam',
+                             *imp.find_module('flimflam', [self._flimflam_dir]))
+    except ImportError:
+      ErrorMsg('Failed to import flimflam.')
+    except:
+      ErrorMsg('Failed to load flimflam.')
+    return None
+
+  @Memorize
+  def load_flimflam(self):
+    """Gets information provided by flimflam (connection manager)
+
+    Returns
+    (None, None) if failed to load module, otherwise
+    (connection_path, connection_info) where
+     connection_path is a dict in {type: device_path},
+     connection_info is a dict of {type: {attribute: value}}.
+    """
+    flimflam = self.import_flimflam_module()
+    if not flimflam:
+      return (None, None)
+    path = {}
+    info = {}
+    info_attribute_names = {
+        self._type_3g: ['Carrier', 'FirmwareRevision', 'HardwareRevision',
+                        'ModelID', 'Manufacturer'],
+    }
+    devices = flimflam.FlimFlam().GetObjectList('Device')
+    unpack = flimflam.convert_dbus_value
+    # TODO(hungte) support multiple devices existence in future
+    for device in devices:
+      # populate the 'path' collection
+      prop = device.GetProperties()
+      prop_type = unpack(prop['Type'])
+      prop_path = unpack(prop['Interface'])
+      if prop_type in path:
+        WarningMsg('Multiple network devices with same type (%s) were found.'
+                   'Target path changed from %s to %s.' %
+                   (prop_type, path[prop_type], prop_path))
+      path[prop_type] = '/sys/class/net/%s/device' % prop_path
+      if prop_type not in info_attribute_names:
+        continue
+      # populate the 'info' collection
+      info[prop_type] = dict((
+          (key, unpack(prop['Cellular.%s' % key]))
+          for key in info_attribute_names[prop_type]
+          if ('Cellular.%s' % key) in prop))
+    return (path, info)
+
+  @Memorize
   def _get_all_connection_info(self):
     """ Probes available connectivity and device information """
     connection_info = {
-        'wireless': '/sys/class/net/wlan0/device',
-        'ethernet': '/sys/class/net/eth0/device',
-        '3g': '/sys/class/tty/ttyUSB0/device',
+        self._type_wireless: '/sys/class/net/wlan0/device',
+        self._type_ethernet: '/sys/class/net/eth0/device',
+        # 3g(cellular) may also be /sys/class/net/usb0
+        self._type_3g: '/sys/class/tty/ttyUSB0/device',
     }
-    flimflam_scripts_base = '/usr/local/lib/flimflam/test'
-    if os.path.exists(flimflam_scripts_base):
-      # TODO(hungte) use flimflam to update the device list.
-      # Currently flimflam seem to be not very stable, so let's ignore it.
-      list_modems = os.path.join(flimflam_scripts_base, 'mm-list-modems')
-      part_id = gft_common.SystemOutput(list_modems, ignore_status=True).strip()
-      if part_id:
-        DebugMsg('mm-list-modems reported: %s' % part_id)
+    (path, _) = self.load_flimflam()
+    if path is not None:
+      # trust flimflam instead.
+      for k in connection_info:
+        connection_info[k] = (path[k] if k in path else '')
     return connection_info
 
   def _get_sysfs_device_info(self, path, primary, optional=[]):
@@ -245,6 +318,8 @@ class HardwareComponents(object):
     Returns
       An identifier string, or self._not_present if not available.
     """
+    if not path:
+      return self._not_present
     path = os.path.realpath(path)
     if not os.path.isdir(path):
       return self._not_present
@@ -252,6 +327,75 @@ class HardwareComponents(object):
     info = (self._get_pci_device_info(path) or
             self._get_usb_device_info(path))
     return info or self._not_present
+
+  def get_sysfs_node_id(self, path):
+    """Gets a sysfs node identifier (for devices that may exist on SOC or bus)
+    Args
+      path: a path to sysfs node (ex, /sys/class/video4linux/video0) which
+            contains a 'device' or 'name' property.
+
+    Returns
+      An identifier string, or self._not_present if not available.
+    """
+    if not path:
+      return self._not_present
+    device_id = self.get_sysfs_device_id(os.path.join(path, 'device'))
+    if device_id:
+      return device_id
+    name_path = os.path.join(path, 'name')
+    if os.path.exists(name_path):
+      return gft_common.ReadOneLine(name_path)
+    return self._not_present
+
+  def compact_id(self, id_info):
+    """Returns a identifier with white space characters compressed
+    Args
+      id_info: a string or list/tuple of identifiers
+
+    Returns
+      A string with all identifiers described by id_info with minimal space
+    """
+    if type(id_info) == list or type(id_info) == tuple:
+      id_info = ' '.join(id_info)
+    return re.sub('\s+', ' ', id_info).strip()
+
+  @Memorize
+  def get_arch(self):
+    """ Gets current system architecture. """
+    return gft_common.GetSystemArch()
+
+  @Memorize
+  def get_ssd_name(self, partition_number=None):
+    """Gets a proper SSD device name by platform (arch) detection.
+    Args
+      partition_number: numeric index for partition. None for whole disk.
+
+    Returns
+      A device name for SSD, base on self.get_arch() result.
+    """
+    arch = self.get_arch()
+    partno = '' if partition_number is None else ('%d' % partition_number)
+    if arch in ('x86', 'amd64'):
+      return 'sda' + partno
+    elif arch in ('arm'):
+      if partno:
+        partno = 'p' + partno
+      return 'mmcblk0' + partno
+    else:
+      assert False, ('get_ssd_name: unknown arch: %s' % arch)
+      return 'sda' + partno
+
+  @Memorize
+  def has_ec(self):
+    """ Returns if current system has programmable EC chips. """
+    arch = self.get_arch()
+    if arch in ('x86', 'amd64'):
+      return True
+    elif arch in ('arm'):
+      return False
+    else:
+      assert False, 'unknown platform for EC information.'
+    return False
 
   # --------------------------------------------------------------------
   # Firmware Processing Utilities
@@ -275,7 +419,7 @@ class HardwareComponents(object):
     parts = []
     lines = gft_common.SystemOutput(
         command,
-        progress_messsage='Reading %s firmware: ' % target_name,
+        progress_message='Reading %s firmware: ' % target_name,
         show_progress=self._verbose).splitlines()
     for line in lines:
       match = re.search(r'Found chip "(.*)" .* at physical address ', line)
@@ -290,16 +434,17 @@ class HardwareComponents(object):
   def load_main_firmware(self):
     """ Loads and cache main (BIOS) firmware image.
 
-    Returns:
+    Returns
         A file name of cached image.
     """
     (_, image_file) = self._load_firmware('main')
     return image_file
 
+  @EcProperty
   def load_ec_firmware(self):
     """ Loads and cache EC firmware image.
 
-    Returns:
+    Returns
         A file name of cached image.
     """
     (_, image_file) = self._load_firmware('ec')
@@ -333,6 +478,7 @@ class HardwareComponents(object):
     output = gft_common.SystemOutput(cmd).splitlines()
     return (output if output else [''])
 
+  @EcProperty
   def get_hash_ec_firmware(self):
     """
     Returns a hash of Embedded Controller firmware parts,
@@ -356,13 +502,13 @@ class HardwareComponents(object):
     return gft_fwhash.GetBIOSReadOnlyHash(file_source=image_file)
 
   def get_part_id_3g(self):
-    device_path = self._get_all_connection_info()['3g']
+    device_path = self._get_all_connection_info()[self._type_3g]
     return self.get_sysfs_device_id(device_path) or self._not_present
 
   def get_part_id_audio_codec(self):
     cmd = 'grep -R Codec: /proc/asound/* | head -n 1 | sed s/.\*Codec://'
     part_id = gft_common.SystemOutput(
-        cmd, progress_messsage='Searching Audio Codecs: ',
+        cmd, progress_message='Searching Audio Codecs: ',
         show_progress=self._verbose).strip()
     return part_id
 
@@ -391,9 +537,37 @@ class HardwareComponents(object):
     return self.get_sysfs_device_id('/sys/bus/pci/devices/0000:00:00.0')
 
   def get_part_id_cpu(self):
-    cmd = 'grep -m 1 "model name" /proc/cpuinfo | sed s/.\*://'
-    part_id = gft_common.SystemOutput(cmd).strip()
-    return part_id
+    part_id = 'Unknown'
+    cpu_info_map = {
+        # arch: (command, core_delta)
+        # The core_delta computation is caused by different report format.
+        # For platforms like x86, it provides names for each core.
+        #  Sample output for dual-core:
+        #   model name : Intel(R) Atom(TM) CPU XXXX
+        #   model name : Intel(R) Atom(TM) CPU XXXX
+        'amd64': (r'sed -nr "s/^model name\t*: (.*)/\1/p" /proc/cpuinfo', 0),
+        'x86': (r'sed -nr "s/^model name\s*: (.*)/\1/p" /proc/cpuinfo', 0),
+        # For platforms like arm, it gives the name only in 'Processor'
+        #  and then a numeric ID for each cores 'processor', so delta is 1.
+        #  Sample output for dual-core:
+        #   Processor : ARMXXXX
+        #   processor : 0
+        #   processor : 1
+        'arm': (r'sed -nr "s/^[Pp]rocessor\s*: (.*)/\1/p" /proc/cpuinfo', 1),
+    }
+    arch = self.get_arch()
+    if arch not in cpu_info_map:
+      return part_id
+    info = gft_common.SystemOutput(cpu_info_map[arch][0]).splitlines()
+    if not info:
+      return part_id
+    cores = len(info) - cpu_info_map[arch][1]
+    info = info[0:1]
+    # TODO(hungte) For backward compatbility, core number reporting on x86 is
+    # disabled. We need to fix HWID component lists in future.
+    if cores > 1 and arch != 'x86':
+      info.append('*%d' % cores)
+    return self.compact_id(info)
 
   def get_part_id_display_panel(self):
     # format:   ModelName "SEC:4231" -> SEC:4231
@@ -414,10 +588,12 @@ class HardwareComponents(object):
     else:
       return self._not_present
 
+  @EcProperty
   def get_part_id_ec_flash_chip(self):
     (chip_id, _) = self._load_firmware('ec')
     return chip_id
 
+  @EcProperty
   def get_part_id_embedded_controller(self):
     # example output:
     #  Found Nuvoton WPCE775x (id=0x05, rev=0x02) at 0x2e
@@ -425,7 +601,7 @@ class HardwareComponents(object):
     parts = []
     res = gft_common.SystemOutput(
         'superiotool',
-        progress_messsage='Probing Embedded Controller: ',
+        progress_message='Probing Embedded Controller: ',
         show_progress=self._verbose,
         ignore_status=True).splitlines()
     for line in res:
@@ -436,7 +612,7 @@ class HardwareComponents(object):
     return part_id
 
   def get_part_id_ethernet(self):
-    device_path = self._get_all_connection_info()['ethernet']
+    device_path = self._get_all_connection_info()[self._type_ethernet]
     return self.get_sysfs_device_id(device_path) or self._not_present
 
   def get_part_id_flash_chip(self):
@@ -448,9 +624,22 @@ class HardwareComponents(object):
     return (part_id if part_id else self._not_present)
 
   def get_part_id_storage(self):
-    cmd = ('cd $(find /sys/devices -name sda)/../..; '
-           'cat vendor model | tr "\n" " " | sed "s/ \\+/ /g"')
-    part_id = gft_common.SystemOutput(cmd).strip()
+    part_id = ''
+    path = gft_common.SystemOutput('find /sys/devices -name "%s"' %
+                                   self.get_ssd_name())
+    path = os.path.join(path.strip(), 'device')
+    if not os.path.exists(path):
+      return part_id
+    info_list = (
+        ['vendor', 'model'],  # ATA
+        ['type', 'name', 'fwrev', 'hwrev', 'oemid', 'manfid'],  # EMMC
+    )
+    for info in info_list:
+      data = [gft_common.ReadOneLine(os.path.join(path, data_file))
+              for data_file in info
+              if os.path.exists(os.path.join(path, data_file))]
+      if data:
+        return self.compact_id(data)
     return part_id
 
   def get_part_id_keyboard(self):
@@ -477,22 +666,31 @@ class HardwareComponents(object):
     return part_id
 
   def get_part_id_usb_hosts(self):
+    arch = self.get_arch()
+    if arch in ('x86', 'amd64'):
+      # on x86, USB hosts are PCI devices, located in parent of root USB.
+      relpath = '..'
+    else:
+      # on ARM and others, use the root device itself.
+      relpath = '.'
+
     usb_bus_list = glob.glob('/sys/bus/usb/devices/usb*')
-    usb_host_list = [os.path.join(os.path.realpath(path), '..')
+    usb_host_list = [os.path.join(os.path.realpath(path), relpath)
                      for path in usb_bus_list]
-    usb_host_info = [self.get_sysfs_device_id(device)
+    # usually there are several USB hosts, so only list the primary information.
+    usb_host_info = [re.sub(' .*', '', self.get_sysfs_device_id(device))
                      for device in usb_host_list]
     usb_host_info.sort(reverse=True)
     return ' '.join(usb_host_info)
 
   def get_part_id_vga(self):
-    return self.get_sysfs_device_id('/sys/class/graphics/fb0/device')
+    return self.get_sysfs_node_id('/sys/class/graphics/fb0')
 
   def get_part_id_webcam(self):
-    return self.get_sysfs_device_id('/sys/class/video4linux/video0/device')
+    return self.get_sysfs_node_id('/sys/class/video4linux/video0')
 
   def get_part_id_wireless(self):
-    device_path = self._get_all_connection_info()['wireless']
+    device_path = self._get_all_connection_info()[self._type_wireless]
     return self.get_sysfs_device_id(device_path) or self._not_present
 
   def get_vendor_id_touchpad_synaptics(self):
@@ -500,33 +698,59 @@ class HardwareComponents(object):
     detect_program = '/opt/Synaptics/bin/syndetect'
     model_string_str = 'Model String'
     firmware_id_str = 'Firmware ID'
-    if os.path.exists(detect_program):
-      data = gft_common.SystemOutput(
-          detect_program,
-          progress_messsage='Synaptics Touchpad: ',
-          show_progress=self._verbose,
-          ignore_status=True)
-      properties = dict(map(str.strip, line.split('=', 1))
-                        for line in data.splitlines() if '=' in line)
-      model = properties.get(model_string_str, 'UnknownModel')
-      firmware_id = properties.get(firmware_id_str, 'UnknownFWID')
 
-      # The pattern " on xxx Port" may vary by the detection approach,
-      # so we need to strip it.
-      model = re.sub(' on [^ ]* [Pp]ort$', '', model)
+    if not os.path.exists(detect_program):
+      return part_id
 
-      # Format: Model #FirmwareId
-      part_id = '%s #%s' % (model, firmware_id)
+    command_list = [detect_program]
+
+    # Determine if X is capturing touchpad
+    locked = os.system('lsof /dev/serio_raw0 2>/dev/null | grep -q "^X"')
+    if (locked == 0) and (not os.getenv('DISPLAY')):
+      ErrorMsg('Warning: You are trying to detect touchpad with X in foreground'
+               ' but not configuring DISPLAY properly for this test.\n'
+               'Test may fail with incorrect detection results.')
+      # Make a trial with default configuration (see cros/cros_ui.py and
+      # suite_Factory/startx.sh)
+      command_list.insert(0, 'DISPLAY=":0"')
+      xauthority_locations = ('/var/run/factory_ui.auth',
+                              '/home/chronos/.Xauthority')
+      valid_xauth = [xauth for xauth in xauthority_locations
+                     if os.path.exists(xauth)]
+      if valid_xauth:
+        command_list.insert(0, 'XAUTHORITY="%s"' % valid_xauth[0])
+
+    (exit_code, data, _) = gft_common.ShellExecution(
+        ' '.join(command_list),
+        ignore_status=True,
+        progress_message='Synaptics Touchpad: ',
+        show_progress=self._verbose)
+    if exit_code != 0:
+      return part_id
+
+    properties = dict(map(str.strip, line.split('=', 1))
+                      for line in data.splitlines() if '=' in line)
+    model = properties.get(model_string_str, 'UnknownModel')
+    firmware_id = properties.get(firmware_id_str, 'UnknownFWID')
+
+    # The pattern " on xxx Port" may vary by the detection approach,
+    # so we need to strip it.
+    model = re.sub(' on [^ ]* [Pp]ort$', '', model)
+
+    # Format: Model #FirmwareId
+    part_id = '%s #%s' % (model, firmware_id)
     return part_id
 
   def get_vendor_id_touchpad_generic(self):
-    cmd_grep = 'grep -i Touchpad /proc/bus/input/devices | sed s/.\*=//'
-    part_id = gft_common.SystemOutput(
-        cmd_grep,
-        progress_messsage='Finding Touchpad: ',
-        show_progress=self._verbose).strip('"')
-    return part_id
+    # TODO(hungte) add more information from id/*
+    # format: N: Name="XXX_trackpad"
+    cmd_grep = 'grep -iE "^N.*(touch *pad|track *pad)" /proc/bus/input/devices'
+    info = gft_common.SystemOutput(cmd_grep, ignore_status=True).splitlines()
+    info = [re.sub('^[^"]*"(.*)"$', r'\1', device)
+            for device in info]
+    return ', '.join(info) or self._not_present
 
+  @Memorize
   def get_vendor_id_touchpad(self):
     method_list = ['synaptics', 'generic']
     part_id = ''
@@ -539,34 +763,21 @@ class HardwareComponents(object):
     return part_id
 
   def get_version_3g_firmware(self):
-    version = 'Unknown'
-    # TODO(hungte) use mm.py directly to prevent the need of shell scripting
-    modem_status = gft_common.SystemOutput('modem status',
-                                           ignore_status=True).splitlines()
-    if not modem_status:
-      return self._not_present
-
-    # status format:
-    # Manufacturer: $VENDOR
-    # Modem: $MODEM
-    # Version: $VERSION_MAY_BE_MULTILINE
-    def ParseInfo(name):
-      data = [line for line in modem_status if line.find('%s: ' % name) >= 0]
-      assert len(data) < 2
-      return data[0].split(': ', 1)[1].strip()
-
-    version = ParseInfo('Version')
-    vendor = ParseInfo('Manufacturer')
-    modem = ParseInfo('Modem')
-
-    if vendor == 'Samsung' and modem == 'GT-Y3300X':
-      # The real version is in "Version:" +2 lines
-      version = ''
-      for i, line in enumerate(modem_status):
-        if 'Version: ' in line:
-          version = modem_status[i + 2].strip()
-          break
-    return version or 'Unknown'
+    (_, attributes) = self.load_flimflam()
+    if attributes and (self._type_3g in attributes):
+      # A list of possible version info combination, since the supported fields
+      # may differ for partners.
+      version_formats = [
+          ['Carrier', 'FirmwareRevision'],
+          ['FirmwareRevision'],
+          ['HardwareRevision']]
+      info = attributes[self._type_3g]
+      for version_format in version_formats:
+        if not set(version_format).issubset(set(info)):
+          continue
+        # compact all fields into single line with limited space
+        return self.compact_id([info[key] for key in version_format])
+    return self._not_present
 
   def get_version_rw_firmware(self):
     """
@@ -700,6 +911,17 @@ class HardwareComponents(object):
       thread.join()
     return results
 
+  def format_failure(self, exact_values, approved_values):
+    message_not_present = 'Not Present'
+    actual = [(message_not_present
+               if value in self._failure_list else value)
+              for value in exact_values]
+    expected = [(message_not_present
+                 if value in self._failure_list else value)
+                for value in approved_values]
+    return ['Actual: %s' % ', '.join(set(actual)),
+            'Expected: %s' % ' | '.join(set(expected))]
+
   def check_enumerable_component(self, cid, exact_values, approved_values):
     if '*' in approved_values:
       return
@@ -710,19 +932,20 @@ class HardwareComponents(object):
       return
 
     # there's some error, let's try to match them in legacy list
-    legacy_approved = filter(self.is_legacy_device_record, approved_values)
-    if set(legacy_approved) == set(approved_values):
+    match_goal = [value for value in approved_values
+                  if value not in self._failure_list]
+    legacy_approved = filter(self.is_legacy_device_record, match_goal)
+    if match_goal and (set(legacy_approved) == set(match_goal)):
       DebugMsg('Start legacy search for cid: ' + cid)
-      # safe for legacy match
       # TODO(hungte) prefetch this list in async batch process.
       legacy_list = self._get_legacy_device_list()
-      matched = list(set(legacy_list).intersection(set(approved_values)))
+      matched = list(set(legacy_list).intersection(set(match_goal)))
       if matched:
         DebugMsg('Changed detected list: %s->%s' % (self._system[cid], matched))
         self._system[cid] = matched
         return
     # update with remaining error.
-    self._failures[cid] = unmatched
+    self._failures[cid] = self.format_failure(exact_values, approved_values)
 
   @Memorize
   def verify_probable_component(self, cid, approved_values):
@@ -740,7 +963,7 @@ class HardwareComponents(object):
     if probed:
       self._system[cid] = value
     else:
-      self._failures[cid] = value
+      self._failures[cid] = self.format_failure(value, approved_values)
 
   def pformat(self, obj):
     return '\n' + self._pp.pformat(obj) + '\n'
