@@ -480,7 +480,7 @@ def ConsoleParser():
   parser.add_option('--upload_method', metavar='METHOD:PARAM',
                     help='assign the upload method (see gft_upload).')
   # Wiping
-  parser.add_option('--wipe_method', metavar='METHOD', default='secure',
+  parser.add_option('--wipe_method', metavar='METHOD', default='fast',
                     help='assign the wipe method (secure/fast).')
 
   # Commands
