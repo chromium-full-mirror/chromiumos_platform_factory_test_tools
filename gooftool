@@ -298,6 +298,9 @@ def verify_rootfs():
 @GFTCommand
 def verify_switch_wp():
   """ Verifies if hardware write protection switch is enabled. """
+  if g_options.debug_dryrun_wpfw:
+    ErrorMsg('wpfw is by-passed. This device CANNOT be qualified.')
+    return True
   if VerifySwitch('write_protect', 1):
     return True
   ErrorDie('verify_switch_wp: failed')
