@@ -226,6 +226,11 @@ def WriteFile(filename, data):
   with open(filename, "w") as opened_file:
     opened_file.write(data)
 
+def WriteBinaryFile(filename, data):
+  """ Writes one binary file and exit. """
+  with open(filename, "wb") as opened_file:
+    opened_file.write(data)
+
 
 def GetSystemArch():
   """Gets current system architecture, in portage-style return value.
@@ -312,6 +317,23 @@ def ExpandComponentsDatabaseMacro(data, database_file):
   return data
 
 
+def ExpandComponentsDatabaseHash(data, database_file):
+  """ Processes and expands virtual hash in a component database. """
+  hashdb_file = os.path.join(os.path.dirname(database_file), 'hash.db')
+  if not os.path.exists(hashdb_file):
+    return data
+  hashdb = eval(ReadFile(hashdb_file))
+  for (key, values) in data.items():
+    if not key.startswith('hash'):
+      continue
+    new_values = [hashdb.get(value, value) for value in values]
+    if new_values != values:
+      data[key] = new_values
+      DebugMsg('ExpandComponentsDatabaseHash: %s: %s -> %s' %
+               (key, values, new_values))
+  return data
+
+
 def LoadComponentsDatabaseFile(filename):
   """ Loads a components database file. """
   original_filename = filename
@@ -339,14 +361,15 @@ def LoadComponentsDatabaseFile(filename):
       filename = os.path.join(base_dir, new_file)
   if len(file_list) > 1:
     DebugMsg('LoadComponentsDatabaseFile: ' + '->'.join(file_list))
+  ExpandComponentsDatabaseHash(result, original_filename)
   ExpandComponentsDatabaseMacro(result, original_filename)
   return result
 
 
 def GetComponentsDatabaseBase(database_file):
   """ Gets the base folder of a components database file.  """
-  # Currently the database file is assuming properties sit in its parent folder.
-  base = os.path.join(os.path.split(os.path.abspath(database_file))[0], '..')
+  # Currently the database file is assuming properties sit in same folder.
+  base = os.path.dirname(os.path.abspath(database_file))
   return os.path.abspath(base)
 
 

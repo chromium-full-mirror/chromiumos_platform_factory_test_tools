@@ -4,6 +4,8 @@
 # Use of this source code is governed by a BSD-style license that can be
 # found in the LICENSE file.
 
+import array
+import fcntl
 import glob
 import imp
 import os
@@ -11,7 +13,10 @@ import pprint
 import re
 import sys
 import threading
+import time
+import types
 
+import edid
 import flashrom_util
 import gft_common
 import gft_fwhash
@@ -26,7 +31,7 @@ class HardwareComponents(object):
   # Function names in this class are used for reflection, so please don't change
   # the function names even if they are not compliant to coding style guide.
 
-  version = 6
+  version = 7
 
   # We divide all component IDs (cids) into 5 categories:
   #  - enumerable: able to get the results by running specific commands;
@@ -36,14 +41,18 @@ class HardwareComponents(object):
   _enumerable_cids = [
     'data_display_geometry',
     'data_release_board',
-    'hash_ec_firmware',
-    'hash_ro_firmware',
-    'part_id_3g',
+    'hash_key_recovery',
+    'hash_key_root',
+    'hash_gbb',
+    'hash_ro_ec_firmware',
+    'hash_ro_main_firmware',
     'part_id_audio_codec',
     'part_id_bluetooth',
-    'part_id_chrontel',
+    'part_id_camera',
+    'part_id_cellular',
     'part_id_chipset',
     'part_id_cpu',
+    'part_id_display_converter',
     'part_id_display_panel',
     'part_id_dram',
     'part_id_ec_flash_chip',
@@ -53,22 +62,20 @@ class HardwareComponents(object):
     'part_id_hwqual',
     'part_id_keyboard',
     'part_id_storage',
+    'part_id_touchpad',
     'part_id_tpm',
     'part_id_usb_hosts',
     'part_id_vga',
-    'part_id_webcam',
     'part_id_wireless',
-    'vendor_id_touchpad',
-    'version_3g_firmware',
+    'version_cellular_firmware',
     'version_rw_firmware',
+    'version_touchpad_firmware',
     # Deprecated fields:
     # 'part_id_gps',
     # - GPS is currently not supported by OS and no way to probe it.
     #   We should enable it only when OS supports it.
     ]
   _probable_cids = [
-    'key_recovery',
-    'key_root',
     'part_id_cardreader',
     ]
   _pure_data_cids = [
@@ -93,9 +100,13 @@ class HardwareComponents(object):
   _failure_list = [_not_present, _no_match, '']
 
   # Type id for connection management (compatible to flimflam)
-  _type_3g = 'cellular'
+  _type_cellular = 'cellular'
   _type_ethernet = 'ethernet'
   _type_wireless = 'wifi'
+
+  # Type id for touchpad information
+  _type_id = 'id'
+  _type_firmware = 'firmware'
 
   _flimflam_dir = '/usr/local/lib/flimflam/test'
 
@@ -216,8 +227,8 @@ class HardwareComponents(object):
     path = {}
     info = {}
     info_attribute_names = {
-        self._type_3g: ['Carrier', 'FirmwareRevision', 'HardwareRevision',
-                        'ModelID', 'Manufacturer'],
+        self._type_cellular: ['Carrier', 'FirmwareRevision', 'HardwareRevision',
+                              'ModelID', 'Manufacturer'],
     }
     devices = flimflam.FlimFlam().GetObjectList('Device')
     unpack = flimflam.convert_dbus_value
@@ -247,8 +258,8 @@ class HardwareComponents(object):
     connection_info = {
         self._type_wireless: '/sys/class/net/wlan0/device',
         self._type_ethernet: '/sys/class/net/eth0/device',
-        # 3g(cellular) may also be /sys/class/net/usb0
-        self._type_3g: '/sys/class/tty/ttyUSB0/device',
+        # cellular may also be /sys/class/net/usb0
+        self._type_cellular: '/sys/class/tty/ttyUSB0/device',
     }
     (path, _) = self.load_flimflam()
     if path is not None:
@@ -256,6 +267,58 @@ class HardwareComponents(object):
       for k in connection_info:
         connection_info[k] = (path[k] if k in path else '')
     return connection_info
+
+  @Memorize
+  def i2cdump(self, bus, address, size):
+    """ Reads binary dump from i2c bus. """
+    # TODO(hungte) Use /usr/sbin/i2cdump if possible
+    self.load_module('i2c_dev')
+    if type(bus) is types.IntType:
+      bus = '/dev/i2c-%d' % bus
+    fd = -1
+    I2C_SLAVE = 0x0703
+    blob = None
+    try:
+      fd = os.open(bus, os.O_RDWR)
+      if fcntl.ioctl(fd, I2C_SLAVE, address) != 0:
+        return blob
+      time.sleep(0.05)  # Wait i2c to get ready
+      if os.write(fd, chr(0)) == 1:
+        blob = os.read(fd, size)
+    except:
+      pass
+    finally:
+      if fd >= 0:
+        os.close(fd)
+    return blob
+
+  @Memorize
+  def load_lvds_edid(self):
+    """ Probes LVDS data by using EDID method. """
+    lvds_files = glob.glob('/sys/class/drm/*LVDS*/edid')
+    if lvds_files:
+      try:
+        return edid.parse_edid_file(lvds_files[0])
+      except ValueError, e:
+        ErrorMsg('EDID Parsing Error: %s' % e)
+
+    # Try i2c
+    self.load_module('i2c_dev')
+    i2c_files = glob.glob('/dev/i2c-?')
+    i2c_files.sort()
+    # LVDS are usually on address 0x50.
+    I2C_LVDS_ADDERSS = 0x50
+    for i2c_file in i2c_files:
+      edid_blob = self.i2cdump(i2c_file, I2C_LVDS_ADDERSS,
+                               edid.EDID_MINIMAL_SIZE)
+      if edid_blob:
+        try:
+          return edid.parse_edid(edid_blob)
+        except ValueError, e:
+          WarningMsg('EDID Parsing Error: %s' % e)
+
+    # TODO(hungte) we can also try xrandr
+    return None
 
   def _get_sysfs_device_info(self, path, primary, optional=[]):
     """Gets the device information of a sysfs node.
@@ -299,7 +362,7 @@ class HardwareComponents(object):
       if os.path.exists(os.path.join(path, 'idProduct')):
         break
       path = os.path.split(path)[0]
-    optional_fields = ['manufacturer', 'product']
+    optional_fields = ['manufacturer', 'product', 'bcdDevice']
     (info, optional) = self._get_sysfs_device_info(
         path, ['idVendor', 'idProduct'], optional_fields)
     if not info:
@@ -465,45 +528,158 @@ class HardwareComponents(object):
     return value
 
   # --------------------------------------------------------------------
+  # Product-Specific Probing
+
+  @Memorize
+  def probe_touchpad(self):
+    """ Probes touchpad information.
+
+    Returns:
+      A dict of { _type_id: 'TOUCHPAD_HWINFO',
+                  _type_firmware: 'TOUCHPAD_FWINFO' }
+    """
+
+    def synaptics():
+      detect_program = '/opt/Synaptics/bin/syndetect'
+      model_string_str = 'Model String'
+      firmware_id_str = 'Firmware ID'
+
+      if not os.path.exists(detect_program):
+        return None
+      command_list = [detect_program]
+      # Determine if X is capturing touchpad
+      locked = os.system('lsof /dev/serio_raw0 2>/dev/null | grep -q "^X"')
+
+      if (locked == 0) and (not os.getenv('DISPLAY')):
+        ErrorMsg('Warning: You are trying to detect touchpad with X in '
+                 'foreground but not configuring DISPLAY properly.\n'
+                 'Test may fail with incorrect detection results.')
+        # Make a trial with default configuration (see cros/cros_ui.py and
+        # suite_Factory/startx.sh)
+        command_list.insert(0, 'DISPLAY=":0"')
+        xauthority_locations = ('/var/run/factory_ui.auth',
+                                '/home/chronos/.Xauthority')
+        valid_xauth = [xauth for xauth in xauthority_locations
+                       if os.path.exists(xauth)]
+        if valid_xauth:
+          command_list.insert(0, 'XAUTHORITY="%s"' % valid_xauth[0])
+
+      (exit_code, data, _) = gft_common.ShellExecution(
+          ' '.join(command_list),
+          ignore_status=True,
+          progress_message='Synaptics Touchpad: ',
+          show_progress=self._verbose)
+      if exit_code != 0:
+        return None
+      properties = dict(map(str.strip, line.split('=', 1))
+                        for line in data.splitlines() if '=' in line)
+      model = properties.get(model_string_str, 'Unknown Synaptics')
+      # The pattern " on xxx Port" may vary by the detection approach,
+      # so we need to strip it.
+      model = re.sub(' on [^ ]* [Pp]ort$', '', model)
+      firmware_id = properties.get(firmware_id_str, self._not_present)
+      return (model, firmware_id)
+
+    def cypress():
+      nodes = glob.glob('/sys/class/input/mouse[0-9]*/device/device')
+      for node in nodes:
+        id_files = ['product_id', 'hardware_version', 'protocol_version']
+        if not all([os.path.exists(os.path.join(node, field))
+                    for field in id_files]):
+          continue
+        firmware_files = ['firmware_version']
+        model = self.compact_id(
+            [gft_common.ReadOneLine(os.path.join(node, field))
+             for field in id_files])
+        firmware_id = self.compact_id(
+            [gft_common.ReadOneLine(os.path.join(node, field))
+             for field in firmware_files
+             if os.path.exists(os.path.join(node, field))])
+        return (model, firmware_id)
+      return None
+
+    def generic():
+      # TODO(hungte) add more information from id/*
+      # format: N: Name="XXX_trackpad"
+      input_file = '/proc/bus/input/devices'
+      cmd_grep = 'grep -iE "^N.*(touch *pad|track *pad)" %s' % input_file
+      info = gft_common.SystemOutput(cmd_grep, ignore_status=True).splitlines()
+      info = [re.sub('^[^"]*"(.*)"$', r'\1', device)
+              for device in info]
+      return (', '.join(info) or self._not_present, self._not_present)
+
+    method_list = [cypress, synaptics, generic]
+    data = { self._type_id: self._not_present,
+             self._type_firmware: self._not_present }
+    for method in method_list:
+      result = method()
+      DebugMsg('probe_touchpad: %s: %s' % (method,result or '<failed>'))
+      if result:
+        data[self._type_id] = result[0]
+        data[self._type_firmware] = result[1]
+        return data
+    return data
+
+  # --------------------------------------------------------------------
   # Enumerable Properties
 
   def get_data_display_geometry(self):
     # Get edid from driver.
     # TODO(nsanders): this is driver specific.
-    # TODO(waihong): read-edid is also x86 only.
-    # format:   Mode "1280x800" -> 1280x800
-    # TODO(hungte) merge this with get_part_id_display_panel
+    # Try EDID
+    lvds_edid = self.load_lvds_edid()
+    if lvds_edid:
+      return '%dx%d' % (lvds_edid[edid.EDID_WIDTH],
+                        lvds_edid[edid.EDID_HEIGHT])
 
-    cmd = ('cat "$(find /sys/devices/ -name edid | grep LVDS)" | '
-           'parse-edid 2>/dev/null | grep "Mode " | cut -d\\" -f2')
-    output = gft_common.SystemOutput(cmd).splitlines()
-    return (output if output else [''])
+    # Try frame buffer
+    fb_modes_file = '/sys/class/graphics/fb0/modes'
+    if os.path.exists(fb_modes_file):
+      # format: U:1366x768p-0
+      fb_mode = gft_common.ReadOneLine(fb_modes_file)
+      geometry = re.search(r'\d+x\d+', fb_mode)
+      if geometry:
+        return geometry.group(0)
+
+    return self._not_present
+
+  def get_hash_gbb(self):
+    image_file = self.load_main_firmware()
+    return gft_fwhash.GetMainFirmwareGbbHash(file_source=image_file)
+
+  def get_hash_key_recovery(self):
+    current_key = self._read_gbb_component('recoverykey')
+    return gft_fwhash.GetKeyHash(current_key)
+
+  def get_hash_key_root(self):
+    current_key = self._read_gbb_component('rootkey')
+    return gft_fwhash.GetKeyHash(current_key)
 
   @EcProperty
-  def get_hash_ec_firmware(self):
+  def get_hash_ro_ec_firmware(self):
     """
-    Returns a hash of Embedded Controller firmware parts,
+    Returns a hash of Embedded Controller firmware read only parts,
     to confirm we have proper updated version of EC firmware.
     """
 
     image_file = self.load_ec_firmware()
     if not image_file:
-      ErrorDie('get_hash_ec_firmware: cannot read firmware')
-    return gft_fwhash.GetECHash(file_source=image_file)
+      ErrorDie('get_hash_ro_ec_firmware: cannot read firmware')
+    return gft_fwhash.GetEcFirmwareReadOnlyHash(file_source=image_file)
 
-  def get_hash_ro_firmware(self):
+  def get_hash_ro_main_firmware(self):
     """
-    Returns a hash of Read Only (BIOS) firmware parts,
+    Returns a hash of main firmware (BIOS) read only parts,
     to confirm we have proper keys / boot code / recovery image installed.
     """
 
     image_file = self.load_main_firmware()
     if not image_file:
-      ErrorDie('get_hash_ro_firmware: cannot read firmware')
-    return gft_fwhash.GetBIOSReadOnlyHash(file_source=image_file)
+      ErrorDie('get_hash_ro_main_firmware: cannot read firmware')
+    return gft_fwhash.GetMainFirmwareReadOnlyHash(file_source=image_file)
 
-  def get_part_id_3g(self):
-    device_path = self._get_all_connection_info()[self._type_3g]
+  def get_part_id_cellular(self):
+    device_path = self._get_all_connection_info()[self._type_cellular]
     return self.get_sysfs_device_id(device_path) or self._not_present
 
   def get_part_id_audio_codec(self):
@@ -511,31 +687,80 @@ class HardwareComponents(object):
     part_id = gft_common.SystemOutput(
         cmd, progress_message='Searching Audio Codecs: ',
         show_progress=self._verbose).strip()
+    # If no codec installed, try PCM.
+    if not part_id:
+      # format: 00-00: WMXXXX PCM wmxxxx-hifi-0: ...
+      pcm_data = gft_common.ReadOneLine('/proc/asound/pcm').split(' ')
+      if len(pcm_data) > 2:
+        part_id = pcm_data[1]
     return part_id
 
   def get_part_id_bluetooth(self):
     return self.get_sysfs_device_id('/sys/class/bluetooth/hci0/device')
 
-  def get_part_id_chrontel(self):
-    """ Gets chrontel HDMI devices by dedicated probing """
+  def get_part_id_camera(self):
+    info = []
+    camera_node = '/sys/class/video4linux/video0'
+    info.append(self.get_sysfs_node_id(camera_node))
+    # For soc-camera, "control/name" is a helpful driver name.
+    control_name = os.path.join(camera_node, 'device/control/name')
+    if os.path.exists(control_name):
+      info.append(gft_common.ReadOneLine(control_name))
+    # Try video4linux2 (v4l2) interface
+    camera_dev = '/dev/video0'
+    if os.path.exists(camera_dev):
+      fd = -1
+      try:
+        fd = os.open(camera_dev, os.O_RDWR)
+        # See /usr/include/linux/videodev2.h for definition
+        VIDIOC_DBG_G_CHIP_IDENT = 0xc02c5651
+        V4L2_DBG_CHIP_IDENT_SIZE = 11
+        V4L2_INDEX_REVISION = V4L2_DBG_CHIP_IDENT_SIZE - 1
+        V4L2_INDEX_IDENT = V4L2_INDEX_REVISION - 1
+        V4L2_VALID_IDENT = 3  # V4L2_IDENT_UNKNOWN + 1
+        v4l2_dbg_chip_ident = array.array('i', [0] * V4L2_DBG_CHIP_IDENT_SIZE)
+        fcntl.ioctl(fd, VIDIOC_DBG_G_CHIP_IDENT, v4l2_dbg_chip_ident, 1)
+        # 'ident' values are defined in include/media/v4l2-chip-ident.h
+        v4l2_ident = v4l2_dbg_chip_ident[V4L2_INDEX_IDENT]
+        if v4l2_ident >= V4L2_VALID_IDENT:
+          info.append('V4L2:%04x %04x' %
+                      (v4l2_ident, v4l2_dbg_chip_ident[V4L2_INDEX_REVISION]))
+      except:
+        pass
+      finally:
+        if fd >= 0:
+          os.close(fd)
+    return self.compact_id(info)
+
+  def get_part_id_display_converter(self):
+    """ Gets display converter by dedicated probing """
     def probe_ch7036():
       self.load_module('i2c_dev')
       probe_cmd = 'ch7036_monitor -p >/dev/null 2>&1'
       return 'ch7036' if os.system(probe_cmd) == 0 else ''
 
     method_list = [probe_ch7036]
-    part_id = ''
+    part_id = self._not_present
     for method in method_list:
       part_id = method()
-      DebugMsg('get_part_id_chrontel: %s: %s' %
+      DebugMsg('get_part_id_display_converter: %s: %s' %
                (method.__name__, part_id or '<failed>'))
       if part_id:
         break
     return part_id
 
   def get_part_id_chipset(self):
-    # Host bridge is always the first PCI device.
-    return self.get_sysfs_device_id('/sys/bus/pci/devices/0000:00:00.0')
+    # On x86, host bridge is always the first PCI device.
+    # For SOC-based system, trust the first compatible list in device-tree
+    # (fdt).
+    part_id = self.get_sysfs_device_id('/sys/bus/pci/devices/0000:00:00.0')
+    fdt_compatible_file = '/proc/device-tree/compatible'
+    if (not part_id) and os.path.exists(fdt_compatible_file):
+      compatible_list = gft_common.ReadOneLine(fdt_compatible_file)
+      # format: manufacturer,model [NUL] compat-manufacturer,model [NUL] ...
+      info = compatible_list.strip(chr(0)).split(chr(0))
+      part_id = self.compact_id(info)
+    return part_id
 
   def get_part_id_cpu(self):
     part_id = 'Unknown'
@@ -571,23 +796,34 @@ class HardwareComponents(object):
     return self.compact_id(info)
 
   def get_part_id_display_panel(self):
-    # format:   ModelName "SEC:4231" -> SEC:4231
+    # Try EDID
+    lvds_edid = self.load_lvds_edid()
+    if lvds_edid:
+      return '%s:%04x' % (lvds_edid[edid.EDID_MANUFACTURER_ID],
+                          lvds_edid[edid.EDID_PRODUCT_ID])
+    # Try frame buffer
+    fb_filename = '/sys/class/graphics/fb0/name'
+    if os.path.exists(fb_filename):
+      return gft_common.ReadOneLine(fb_filename)
 
-    cmd = ('cat "$(find /sys/devices/ -name edid | grep LVDS)" | '
-           'parse-edid 2>/dev/null | grep ModelName | cut -d\\" -f2')
-    output = gft_common.SystemOutput(cmd).strip()
-    return (output if output else self._not_present)
+    return self._not_present
 
   def get_part_id_dram(self):
-    # TODO(hungte) if we only want DRAM size, maybe no need to use mosys
-    self.load_module('i2c_dev')
-    cmd = ('mosys -l memory spd print geometry | '
-           'grep size_mb | cut -f2 -d"|"')
-    part_id = gft_common.SystemOutput(cmd).strip()
-    if part_id != '':
-      return part_id
-    else:
-      return self._not_present
+    arch = self.get_arch()
+    if arch in ('x86', 'amd64'):
+      # TODO(hungte) if we only want DRAM size, maybe no need to use mosys
+      self.load_module('i2c_dev')
+      cmd = ('mosys -l memory spd print geometry | '
+             'grep size_mb | cut -f2 -d"|"')
+      part_id = gft_common.SystemOutput(cmd).strip()
+    elif arch in ('arm'):
+      # Even kernel cannot probe the memory. We can only trust the memory
+      # information passed to kernel.
+      param = gft_common.ReadOneLine('/proc/cmdline')
+      # Format: *mem=384M@0M (type=size@address)
+      part_id = '%d' % sum(
+          [int(size) for size in re.findall(r'\s\w*mem=(\d+)M@\d+M', param)])
+    return part_id if part_id else self._not_present
 
   @EcProperty
   def get_part_id_ec_flash_chip(self):
@@ -622,15 +858,19 @@ class HardwareComponents(object):
 
   def get_part_id_hwqual(self):
     part_id = gft_common.SystemOutput('crossystem hwid').strip()
+    # TODO(hungte) compare this with HWID in GBB.
     return (part_id if part_id else self._not_present)
 
   def get_part_id_storage(self):
-    part_id = ''
-    path = gft_common.SystemOutput('find /sys/devices -name "%s"' %
-                                   self.get_ssd_name())
-    path = os.path.join(path.strip(), 'device')
+    part_id = self._not_present
+    node = '/sys/class/block/%s' % self.get_ssd_name()
+    path = os.path.join(node, 'device')
     if not os.path.exists(path):
       return part_id
+    size = ''
+    size_path = os.path.join(node, 'size')
+    if os.path.exists(size_path):
+      size = '#' + gft_common.ReadOneLine(size_path)
     info_list = (
         ['vendor', 'model'],  # ATA
         ['type', 'name', 'fwrev', 'hwrev', 'oemid', 'manfid'],  # EMMC
@@ -640,7 +880,7 @@ class HardwareComponents(object):
               for data_file in info
               if os.path.exists(os.path.join(path, data_file))]
       if data:
-        return self.compact_id(data)
+        return self.compact_id(data + [size])
     return part_id
 
   def get_part_id_keyboard(self):
@@ -651,16 +891,20 @@ class HardwareComponents(object):
         image_file).strip()
     return part_id or self._not_present
 
+  def get_part_id_touchpad(self):
+    data = self.probe_touchpad()
+    return data[self._type_id]
+
   def get_part_id_tpm(self):
     """ Returns Manufacturer_info : Chip_Version """
     cmd = 'tpm_version'
+    part_id = self._not_present
     tpm_output = gft_common.SystemOutput(cmd)
     tpm_lines = tpm_output.splitlines()
     tpm_dict = {}
     for tpm_line in tpm_lines:
       [key, colon, value] = tpm_line.partition(':')
       tpm_dict[key.strip()] = value.strip()
-    part_id = ''
     (key1, key2) = ('Manufacturer Info', 'Chip Version')
     if key1 in tpm_dict and key2 in tpm_dict:
       part_id = tpm_dict[key1] + ':' + tpm_dict[key2]
@@ -687,92 +931,20 @@ class HardwareComponents(object):
   def get_part_id_vga(self):
     return self.get_sysfs_node_id('/sys/class/graphics/fb0')
 
-  def get_part_id_webcam(self):
-    return self.get_sysfs_node_id('/sys/class/video4linux/video0')
-
   def get_part_id_wireless(self):
     device_path = self._get_all_connection_info()[self._type_wireless]
     return self.get_sysfs_device_id(device_path) or self._not_present
 
-  def get_vendor_id_touchpad_synaptics(self):
-    part_id = ''
-    detect_program = '/opt/Synaptics/bin/syndetect'
-    model_string_str = 'Model String'
-    firmware_id_str = 'Firmware ID'
-
-    if not os.path.exists(detect_program):
-      return part_id
-
-    command_list = [detect_program]
-
-    # Determine if X is capturing touchpad
-    locked = os.system('lsof /dev/serio_raw0 2>/dev/null | grep -q "^X"')
-    if (locked == 0) and (not os.getenv('DISPLAY')):
-      ErrorMsg('Warning: You are trying to detect touchpad with X in foreground'
-               ' but not configuring DISPLAY properly for this test.\n'
-               'Test may fail with incorrect detection results.')
-      # Make a trial with default configuration (see cros/cros_ui.py and
-      # suite_Factory/startx.sh)
-      command_list.insert(0, 'DISPLAY=":0"')
-      xauthority_locations = ('/var/run/factory_ui.auth',
-                              '/home/chronos/.Xauthority')
-      valid_xauth = [xauth for xauth in xauthority_locations
-                     if os.path.exists(xauth)]
-      if valid_xauth:
-        command_list.insert(0, 'XAUTHORITY="%s"' % valid_xauth[0])
-
-    (exit_code, data, _) = gft_common.ShellExecution(
-        ' '.join(command_list),
-        ignore_status=True,
-        progress_message='Synaptics Touchpad: ',
-        show_progress=self._verbose)
-    if exit_code != 0:
-      return part_id
-
-    properties = dict(map(str.strip, line.split('=', 1))
-                      for line in data.splitlines() if '=' in line)
-    model = properties.get(model_string_str, 'UnknownModel')
-    firmware_id = properties.get(firmware_id_str, 'UnknownFWID')
-
-    # The pattern " on xxx Port" may vary by the detection approach,
-    # so we need to strip it.
-    model = re.sub(' on [^ ]* [Pp]ort$', '', model)
-
-    # Format: Model #FirmwareId
-    part_id = '%s #%s' % (model, firmware_id)
-    return part_id
-
-  def get_vendor_id_touchpad_generic(self):
-    # TODO(hungte) add more information from id/*
-    # format: N: Name="XXX_trackpad"
-    cmd_grep = 'grep -iE "^N.*(touch *pad|track *pad)" /proc/bus/input/devices'
-    info = gft_common.SystemOutput(cmd_grep, ignore_status=True).splitlines()
-    info = [re.sub('^[^"]*"(.*)"$', r'\1', device)
-            for device in info]
-    return ', '.join(info) or self._not_present
-
-  @Memorize
-  def get_vendor_id_touchpad(self):
-    method_list = ['synaptics', 'generic']
-    part_id = ''
-    for method in method_list:
-      part_id = getattr(self, 'get_vendor_id_touchpad_%s' % method)()
-      DebugMsg('get_vendor_id_touchpad: %s: %s' %
-               (method, part_id or '<failed>'))
-      if part_id:
-        break
-    return part_id
-
-  def get_version_3g_firmware(self):
+  def get_version_cellular_firmware(self):
     (_, attributes) = self.load_flimflam()
-    if attributes and (self._type_3g in attributes):
+    if attributes and (self._type_cellular in attributes):
       # A list of possible version info combination, since the supported fields
       # may differ for partners.
       version_formats = [
           ['Carrier', 'FirmwareRevision'],
           ['FirmwareRevision'],
           ['HardwareRevision']]
-      info = attributes[self._type_3g]
+      info = attributes[self._type_cellular]
       for version_format in version_formats:
         if not set(version_format).issubset(set(info)):
           continue
@@ -794,6 +966,7 @@ class HardwareComponents(object):
     firmwar update so return value is a "error report" in the form "A=x, B=y".
     """
 
+    # TODO(hungte) Support new VBLOCK, or use vbutil_firmware
     versions = [None, None]
     section_names = ['VBLOCK_A', 'VBLOCK_B']
     image_file = self.load_main_firmware()
@@ -818,20 +991,12 @@ class HardwareComponents(object):
       return 'A=%d, B=%d' % (versions[0], versions[1])
     return '%d' % versions[0]
 
+  def get_version_touchpad_firmware(self):
+    data = self.probe_touchpad()
+    return data[self._type_firmware]
+
   # --------------------------------------------------------------------
   # Probable Properties
-
-  def probe_key_recovery(self, part_id):
-    current_key = self._read_gbb_component('recoverykey')
-    file_path = os.path.join(self._file_base, part_id)
-    target_key = gft_common.ReadBinaryFile(file_path)
-    return current_key.startswith(target_key)
-
-  def probe_key_root(self, part_id):
-    current_key = self._read_gbb_component('rootkey')
-    file_path = os.path.join(self._file_base, part_id)
-    target_key = gft_common.ReadBinaryFile(file_path)
-    return current_key.startswith(target_key)
 
   def probe_part_id_cardreader(self, part_id):
     # A cardreader is always power off until a card inserted. So checking

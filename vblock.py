@@ -52,8 +52,7 @@ def unpack_VbKeyBlockHeader(blob, offset=0):
         raise ValueError, 'unknown key block magic: %s' % header['magic']
     major = header['header_version_major']
     minor = header['header_version_minor']
-    if major != KEY_BLOCK_HEADER_VERSION_MAJOR or \
-       minor != KEY_BLOCK_HEADER_VERSION_MINOR:
+    if (major != KEY_BLOCK_HEADER_VERSION_MAJOR):
        raise ValueError, 'unknown key block version (%d.%d)' % (major, minor)
     return header
 
@@ -87,8 +86,7 @@ def unpack_VbFirmwarePreambleHeader(blob, offset=0):
     # check values
     major = header['header_version_major']
     minor = header['header_version_minor']
-    if major != FIRMWARE_PREAMBLE_HEADER_VERSION_MAJOR or \
-       minor != FIRMWARE_PREAMBLE_HEADER_VERSION_MINOR:
+    if major != FIRMWARE_PREAMBLE_HEADER_VERSION_MAJOR:
        raise ValueError, 'unknown preamble version: (%d.%d)' % (major, minor)
     return header
 
@@ -114,11 +112,12 @@ def unpack_verification_block(blob, offset=0):
 
 def test_report_vblock_info(blob, offset=0):
     """ Reports the information of a vblock blob. """
-    kb_header = unpack_VbKeyBlockHeader(msg, offset)
+    kb_header = unpack_VbKeyBlockHeader(blob, offset)
     print "-- VbKeyBlockHeader --"
     for name, value in kb_header.items():
         print name, ':', value
-    preamble = unpack_VbFirmwarePreambleHeader(msg, kb_header['key_block_size'])
+    preamble = unpack_VbFirmwarePreambleHeader(blob,
+                                               kb_header['key_block_size'])
     print "-- VbFirmwarePreambleHeader --"
     for name, value in preamble.items():
         print name, ':', value
@@ -129,4 +128,4 @@ def test_report_vblock_info(blob, offset=0):
 if __name__ == "__main__":
     # when running in command line, try to report blob in the parameters
     for filename in sys.argv[1:]:
-        test_report_blob_info(open(filename, "rb").read())
+        test_report_vblock_info(open(filename, "rb").read())
