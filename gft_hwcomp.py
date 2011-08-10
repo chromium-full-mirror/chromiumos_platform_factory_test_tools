@@ -35,6 +35,7 @@ class HardwareComponents(object):
 
   _enumerable_cids = [
     'data_display_geometry',
+    'data_release_board',
     'hash_ec_firmware',
     'hash_ro_firmware',
     'part_id_3g',
