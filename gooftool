@@ -15,6 +15,7 @@ import optparse
 import os
 import re
 import sys
+import tempfile
 
 ########################################################################
 # cros/gft modules
@@ -389,14 +390,14 @@ def verify_switch_dev():
 def create_report():
   """ Creates the report (with vpd, hwid, date, ...) for uploading. """
   # decide log format
-  suffix = '.log'
   if g_options.report_format == 'gz':
     text_armed = False
-    suffix = suffix + '.gz'
   elif g_options.report_format == 'base64':
     text_armed = True
   else:
     ErrorDie('create_report: invalid format: %s' % g_options.report_format)
+
+  tag = g_options.report_tag if g_options.report_tag else ''
 
   # TODO(hungte) if matching is still too slow, we can try to reused previous
   # cached results.
@@ -410,20 +411,13 @@ def create_report():
                                    matched.values()[0],
                                    verbose_log_path=g_options.log_path,
                                    vpd_source=vpd_source,
+                                   tag=tag,
                                    verbose=g_options.debug)
-
-  # Printing this to log may double the log files...
-  if g_options.verbose:
-    sys.stdout.flush()
-    reduced = copy.deepcopy(report)
-    reduced['verbose_log'] = ['...(not listed, please check report)...']
-    sys.stderr.write("Report Detail:\n%s\n" % gft_report.FormatReport(reduced))
 
   data = gft_report.EncodeReport(report, text_armed=text_armed)
   if not g_options.report_path:
-    # create one in temporary folder
-    g_options.report_path = gft_common.GetTemporaryFileName(prefix='gftrpt_',
-                                                            suffix=suffix)
+    g_options.report_path = os.path.join(tempfile.gettempdir(),
+                                         gft_report.GetReportName(data))
 
   gft_common.WriteFile(g_options.report_path, data)
   report_saved_message = 'Report saved in: %s' % g_options.report_path
@@ -442,7 +436,14 @@ def upload_report():
              '(--report_path or --create_report)')
   if not g_options.upload_method:
     ErrorDie('upload_report: need proper --upload_method.')
-  if not gft_upload.Upload(report_path, g_options.upload_method):
+
+  # Always report in standard naming scheme.
+  report_blob = gft_common.ReadBinaryFile(report_path)
+  report_name = gft_report.GetReportName(report_blob)
+  local_file = os.path.join(tempfile.gettempdir(), report_name)
+  if local_file != report_path:
+    gft_common.WriteBinaryFile(local_file, report_blob)
+  if not gft_upload.Upload(local_file, g_options.upload_method):
     ErrorDie('upload_report: failed to upload.')
   return True
 
@@ -568,6 +569,9 @@ def ConsoleParser():
                     help='override the path for report file')
   parser.add_option('--report_format', metavar='FORMAT', default='gz',
                     help='format of the generated report (see gft_report.py)')
+  parser.add_option('--report_tag', metavar='TAG', default='',
+                    help='tag to be included in report (see gft_report.py), '
+                         'current possible values may include rma, mp, pvt.')
   parser.add_option('--upload_method', metavar='METHOD:PARAM',
                     help='assign the upload method (see gft_upload).')
   # Wiping
