@@ -126,7 +126,8 @@ chromeos_invoke_postinst() {
     return 1
   }
   alert "Running postinst for $rootdev..."
-  IS_INSTALL=1 "$mount_point"/postinst --noupdate_firmware "$rootdev" ||
+  # IS_FACTORY_INSTALL is used to prevent postinst trying to update firmare.
+  IS_FACTORY_INSTALL=1 IS_INSTALL=1 "$mount_point"/postinst "$rootdev" ||
     failure="$?"
   umount -f "$mount_point" ||
     alert "WARNING: Failed to unmount partition $rootdev"
