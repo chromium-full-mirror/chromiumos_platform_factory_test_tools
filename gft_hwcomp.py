@@ -63,6 +63,7 @@ class HardwareComponents(object):
     'part_id_flash_chip',
     'part_id_hwqual',
     'part_id_keyboard',
+    'part_id_motherboard',
     'part_id_storage',
     'part_id_touchpad',
     'part_id_tpm',
@@ -687,6 +688,14 @@ class HardwareComponents(object):
     if not image_file:
       ErrorDie('get_hash_ro_main_firmware: cannot read firmware')
     return gft_fwhash.GetMainFirmwareReadOnlyHash(file_source=image_file)
+
+  def get_part_id_motherboard(self):
+    # VPD value "model_name"="STUMPY2" should be listed.
+    image_file = self.load_main_firmware()
+    part_id = gft_common.SystemOutput(
+       'vpd -i RO_VPD -l -f "%s" | grep model_name | cut -f4 -d\\"' %
+       image_file).strip()
+    return part_id or self._not_present
 
   def get_part_id_cellular(self):
     device_path = self._get_all_connection_info()[self._type_cellular]
