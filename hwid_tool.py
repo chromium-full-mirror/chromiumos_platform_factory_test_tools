@@ -964,7 +964,8 @@ def LegacyExport(config, data):
       export_data['version_' + ic_class] = [ic_value]
     export_data['config_factory_initial'] = sorted(
         'version_' + ic_class for ic_class in initial_config)
-    export_data.update(extra_fields)
+    if extra_fields != None:
+        export_data.update(extra_fields)
     hwid_file_name = ('components ' + hwid_str).replace(' ', '_')
     hwid_file_path = os.path.join(config.dest_dir, hwid_file_name)
     with open(hwid_file_path, 'w') as f:
